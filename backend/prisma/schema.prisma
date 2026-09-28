@@ -1,0 +1,84 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Article {
+  id                String   @id @default(uuid())
+  keyword           String   // Added for deduplication of topics
+  headline          String
+  summary           String[] // 5 bullet points
+  contentBlocks     String[] // Array of 8 paragraphs for the frontend
+  sectionHeadings   String[] // 4 editorial section headings
+  highlightedFacts  String[] // 4 pull-quote worthy key facts
+  sentiment         String   // "Positive" | "Negative" | "Neutral"
+  categories        String[] // ["Tech", "Business", "Science", "Health", "Entertainment", "Finance"]
+  imageUrl          String?  // og:image extracted from the article page
+  imageUrls         String[] // All scraped image URLs from the articles
+  videoUrl          String?  // Stores the AI-generated MP4 video URL
+  enrichmentStatus  String   @default("complete") // "pending" | "complete"
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @default(now()) @updatedAt
+  views             ArticleView[]
+  chunks            ArticleChunk[]
+  socialPublishState SocialPublishState?
+
+  @@index([keyword])
+  @@index([createdAt])
+  @@index([categories])
+}
+
+model SocialPublishState {
+  id              String   @id @default(uuid())
+  articleId       String   @unique
+  article         Article  @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  xStatus         String   @default("pending") // "pending" | "success" | "failed"
+  threadsStatus   String   @default("pending") // "pending" | "success" | "failed"
+  facebookStatus  String   @default("pending") // "pending" | "success" | "failed"
+  instagramStatus String   @default("pending") // "pending" | "success" | "failed"
+  attempts        Int      @default(0)
+  lastAttempt     DateTime?
+  errorMessage    String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([articleId])
+}
+
+model ArticleChunk {
+  id        String   @id @default(uuid())
+  articleId String
+  article   Article  @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  type      String
+  position  Int
+  content   String
+  embedding Unsupported("vector")
+  createdAt DateTime @default(now())
+
+  @@index([articleId])
+  @@index([type])
+  @@unique([articleId, type, position])
+}
+
+model ArticleView {
+  id        String   @id @default(uuid())
+  articleId String
+  viewedAt  DateTime @default(now())
+  article   Article  @relation(fields: [articleId], references: [id], onDelete: Cascade)
+
+  @@index([articleId])
+  @@index([viewedAt])
+}
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String
+  name         String
+  role         String   @default("user") // "user" | "admin"
+  createdAt    DateTime @default(now())
+}

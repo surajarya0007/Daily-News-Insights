@@ -1,0 +1,2 @@
+This is a placeholder file to ensure the public directory is not empty.
+Do not place index.html here, as it would override the Cloud Run rewrite for the homepage.
