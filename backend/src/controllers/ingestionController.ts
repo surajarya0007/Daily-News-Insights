@@ -286,7 +286,7 @@ ${sourcesText}`;
 /**
  * Searches Google News for articles matching a query/keyword.
  */
-async function fetchArticlesForKeyword(keyword: string): Promise<{ title: string; url: string; description: string }[]> {
+export async function fetchArticlesForKeyword(keyword: string): Promise<{ title: string; url: string; description: string }[]> {
   try {
     const hl = 'en-IN';
     const gl = 'IN';

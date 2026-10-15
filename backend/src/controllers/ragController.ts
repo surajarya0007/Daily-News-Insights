@@ -3,11 +3,12 @@ import {
   indexArticleIfPossible,
   buildRagAnswer,
   retrieveArticlesForQuery,
+  synthesizeLiveWebAnswer,
   type RagChatHistoryMessage,
   type RagArticleLike,
 } from '../services/ragService';
 
-import { runIngestionPipeline } from './ingestionController';
+import { runIngestionPipeline, fetchArticlesForKeyword } from './ingestionController';
 import {
   markIngestionStarted,
   markIngestionComplete,
@@ -73,39 +74,63 @@ export async function chatWithArticles(req: Request, res: Response) {
     let answer = await buildRagAnswer(query, sanitizedHistory, sources);
 
     const needsIngestion = answer.needsIngestion || sources.length === 0;
-    const searchKeyword = answer.searchKeyword || query.slice(0, 40);
+    const searchKeyword = (answer.searchKeyword || query).slice(0, 50).trim();
 
     // If Gemini specifies that we need ingestion or there are 0 database sources
     if (needsIngestion && searchKeyword) {
-      console.log(`[RAG] Inline ingestion triggered for keyword: "${searchKeyword}"`);
-      markIngestionStarted('search', searchKeyword);
-      
-      try {
-        const ingestRes = await runIngestionPipeline(undefined, undefined, searchKeyword, 'search');
-        
-        markIngestionComplete('search', {
-          ingestedCount: ingestRes.ingestedCount,
-          skippedCount: ingestRes.skippedCount,
-          errorsCount: ingestRes.errorsCount,
-        });
+      console.log(`[RAG] Real-time live news fetch for: "${searchKeyword}"`);
 
-        if (ingestRes.ingestedCount > 0) {
-          console.log(`[RAG] Ingestion successful. Re-querying vector index for: "${query}"`);
-          sources = await retrieveArticlesForQuery(query, { limit, category });
-          answer = await buildRagAnswer(query, sanitizedHistory, sources);
-        } else {
-          console.log(`[RAG] Ingestion found no matching news articles for: "${searchKeyword}"`);
-          answer.answer = `I searched Google News for "${searchKeyword}" but couldn't find any recent articles or updates. Consequently, I don't have enough verified information in my database to answer your question about "${query}".`;
+      // 1. Fetch live RSS snippets instantly (< 500ms)
+      const liveItems = await fetchArticlesForKeyword(searchKeyword);
+
+      if (liveItems && liveItems.length > 0) {
+        // 2. Synthesize an immediate grounded answer from the live RSS items (< 1.5s)
+        const liveResult = await synthesizeLiveWebAnswer(query, sanitizedHistory, liveItems);
+
+        if (liveResult.answer && liveResult.answer.trim()) {
+          answer.answer = liveResult.answer;
+          answer.suggestions = liveResult.suggestions;
         }
-      } catch (ingestError: any) {
-        console.error(`[RAG] Inline ingestion failed:`, ingestError);
-        markIngestionError('search', ingestError.message || String(ingestError));
-        answer.answer = `I attempted to search Google News and update my database for your query, but encountered an error. Please try again in a moment.`;
+
+        // Map live RSS items into source cards for the frontend
+        sources = liveItems.slice(0, 4).map((item, idx) => ({
+          articleId: `live-${idx}`,
+          headline: item.title,
+          keyword: searchKeyword,
+          categories: [category || 'World'],
+          sentiment: 'Neutral',
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          articleUrl: item.url,
+          chunkType: 'headline' as const,
+          chunkPosition: 0,
+          chunkContent: item.description || item.title,
+          similarity: 0.95 - idx * 0.05,
+        }));
+
+        // 3. LAZY BACKGROUND INGESTION (Fire-and-forget, non-blocking)
+        // Crawls full articles, generates 768-dim embeddings, and stores in Postgres & Redis
+        console.log(`[RAG] Scheduling lazy background ingestion for: "${searchKeyword}"`);
+        markIngestionStarted('search', searchKeyword);
+        void runIngestionPipeline(undefined, undefined, searchKeyword, 'search')
+          .then((ingestRes) => {
+            console.log(`[RAG] Background ingestion finished for "${searchKeyword}": Ingested ${ingestRes.ingestedCount}, Skipped ${ingestRes.skippedCount}`);
+            markIngestionComplete('search', ingestRes);
+          })
+          .catch((err) => {
+            console.error(`[RAG] Background ingestion failed for "${searchKeyword}":`, err);
+            markIngestionError('search', err.message || String(err));
+          });
+      } else {
+        console.log(`[RAG] No live articles found on Google News for: "${searchKeyword}"`);
+        if (!answer.answer || answer.answer.trim() === '') {
+          answer.answer = `I searched our database and live news feeds for "${query}", but couldn't find any recent verified coverage on this topic.`;
+        }
       }
     }
 
     if (!answer.answer || answer.answer.trim() === '') {
-      answer.answer = `I couldn't find any matching coverage in Daily News Insights for "${query}", and no live news updates were found on Google News.`;
+      answer.answer = `I couldn't find any matching coverage in Daily News Insights for "${query}", and no live news updates were found.`;
     }
 
     return res.status(200).json({

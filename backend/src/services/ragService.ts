@@ -739,6 +739,82 @@ export function buildSourceSnippet(content: string): string {
   return stripChunkPrefix(content);
 }
 
+/**
+ * Synthesizes an immediate answer based on live Google News RSS snippets
+ * when no deep article exists yet in the database.
+ */
+export async function synthesizeLiveWebAnswer(
+  query: string,
+  history: RagChatHistoryMessage[],
+  newsItems: { title: string; url: string; description: string }[]
+): Promise<{ answer: string; suggestions: string[] }> {
+  const snippetsText = newsItems
+    .slice(0, 5)
+    .map((item, idx) => `[Source ${idx + 1}]: "${item.title}"\nSummary: ${item.description || 'No snippet provided.'}\nLink: ${item.url}`)
+    .join('\n\n');
+
+  const historyText = history
+    .slice(-4)
+    .map((m) => `${m.role.toUpperCase()}: ${m.content}`)
+    .join('\n');
+
+  const prompt = `You are the Daily News Insights (DNI) breaking news assistant.
+The user is asking a question that is emerging or breaking. Answer their question clearly, neutrally, and accurately based on the latest breaking news snippets below.
+
+Conversation History:
+${historyText || 'No prior conversation.'}
+
+User Question:
+${query}
+
+Breaking News Snippets:
+${snippetsText}
+
+Instructions:
+1. Provide a well-structured, 2-3 paragraph answer summarizing what happened based on the breaking news snippets.
+2. Note that this is breaking coverage and more in-depth reporting is currently being processed.
+3. Suggest 3 relevant follow-up questions the user might ask next.
+
+Return ONLY valid JSON matching this format:
+{
+  "answer": "string",
+  "suggestions": ["string", "string", "string"]
+}`;
+
+  if (!hasGeminiApiKey()) {
+    return {
+      answer: `Here is the latest news regarding "${query}":\n\n` +
+        newsItems.slice(0, 3).map(n => `• **${n.title}** - ${n.description || ''}`).join('\n\n'),
+      suggestions: newsItems.slice(0, 3).map(n => n.title),
+    };
+  }
+
+  try {
+    const model = getChatModel();
+    const result = await model.generateContent({
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: {
+        responseMimeType: 'application/json',
+      },
+    });
+
+    const parsed = JSON.parse(result.response.text().trim());
+    return {
+      answer: typeof parsed.answer === 'string' ? parsed.answer : '',
+      suggestions: Array.isArray(parsed.suggestions)
+        ? parsed.suggestions.filter((item: unknown): item is string => typeof item === 'string')
+        : [],
+    };
+  } catch (error) {
+    console.error('[RAG] Live web answer synthesis failed:', error);
+    return {
+      answer: `Based on the latest breaking reports for "${query}":\n\n` +
+        newsItems.slice(0, 3).map(n => `• **${n.title}**\n${n.description || ''}`).join('\n\n'),
+      suggestions: newsItems.slice(0, 3).map(n => n.title),
+    };
+  }
+}
+
 export function buildArticleLink(category: string, headline: string): string {
   return articleUrl(category, headline);
 }
