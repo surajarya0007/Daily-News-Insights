@@ -15,9 +15,9 @@ export const GEMINI_SEARCH_MIN_CHARS = 500;
 
 /** Gemini models tried in order; falls back to the next on 429 / quota / 503 errors */
 export const GEMINI_MODEL_CHAIN = [
+  'gemini-3.1-flash-lite',
   'gemini-2.5-flash',
   'gemini-2.5-flash-lite',
-  'gemini-3.1-flash-lite',
 ] as const;
 
 /** Default delay between articles during ingestion (primary model ~5 RPM) */
