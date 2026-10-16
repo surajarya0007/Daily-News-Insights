@@ -7,16 +7,17 @@ import { articleUrl } from '../utils/seo';
 
 const CHAT_MODEL = GEMINI_MODEL_CHAIN[0];
 const EMBEDDING_MODEL = 'gemini-embedding-001';
-const RAG_SEARCH_THRESHOLD = 0.55;
+const RAG_SEARCH_THRESHOLD = 0.68;
 const EMBEDDING_DIMENSIONS = 768;
 const USE_REMOTE_EMBEDDING = true; // Set to false to run offline local hashing if out of daily Gemini quota
 
 const STOP_WORDS = new Set([
-  'a', 'an', 'and', 'are', 'as', 'at', 'be', 'by', 'for', 'from', 'has', 'have',
-  'he', 'her', 'his', 'i', 'in', 'is', 'it', 'its', 'of', 'on', 'or', 'that',
-  'the', 'their', 'them', 'there', 'these', 'they', 'this', 'to', 'was', 'were',
-  'will', 'with', 'after', 'before', 'about', 'into', 'over', 'under', 'while',
-  'what', 'when', 'where', 'who', 'why', 'how', 'latest', 'new', 'news',
+  'a', 'an', 'and', 'are', 'as', 'at', 'be', 'by', 'do', 'for', 'from', 'has', 'have',
+  'he', 'her', 'his', 'i', 'if', 'in', 'is', 'it', 'its', 'my', 'no', 'of', 'on', 'or',
+  'so', 'that', 'the', 'their', 'them', 'there', 'these', 'they', 'this', 'to', 'up',
+  'was', 'we', 'were', 'will', 'with', 'after', 'before', 'about', 'into', 'over', 'under',
+  'while', 'what', 'when', 'where', 'who', 'why', 'how', 'latest', 'new', 'news',
+  'pm', 'cm', 'dr', 'mr', 'mrs', 'ms',
 ]);
 
 type ChunkType = 'headline' | 'summary' | 'paragraph';
@@ -147,7 +148,7 @@ function tokenize(text: string): string[] {
     .replace(/[^a-z0-9\s]+/g, ' ')
     .split(/\s+/)
     .map((token) => token.trim())
-    .filter((token) => token.length > 2 && !STOP_WORDS.has(token));
+    .filter((token) => token.length >= 2 && !STOP_WORDS.has(token));
 }
 
 function textToVector(text: string): number[] {
@@ -520,7 +521,7 @@ export async function searchSemanticArticles(
   }
 ): Promise<RagSearchResult[]> {
   const limit = options?.limit ?? 8;
-  const threshold = options?.threshold ?? (isUsingLocalFallback ? 0.45 : RAG_SEARCH_THRESHOLD);
+  const threshold = options?.threshold ?? (isUsingLocalFallback ? 0.50 : RAG_SEARCH_THRESHOLD);
   const category = options?.category?.trim();
   const normalizedQuery = normalizeText(query);
 
@@ -548,37 +549,60 @@ export async function searchSemanticArticles(
       chunkContent: string;
       similarity: number;
     }>>(Prisma.sql`
-      WITH scored AS (
+      WITH scored_chunks AS (
         SELECT
-          ac."articleId" AS "articleId",
-          a.keyword AS keyword,
-          a.headline AS headline,
-          a.categories AS categories,
-          a.sentiment AS sentiment,
-          a."createdAt" AS "createdAt",
-          a."updatedAt" AS "updatedAt",
+          ac."articleId",
           ac.type AS "chunkType",
           ac.position AS "chunkPosition",
           ac.content AS "chunkContent",
-          1 - (ac.embedding <=> ${vector}::vector) AS similarity,
-          ROW_NUMBER() OVER (
-            PARTITION BY ac."articleId"
-            ORDER BY ac.embedding <=> ${vector}::vector ASC, ac.position ASC
-          ) AS rn
+          1 - (ac.embedding <=> ${vector}::vector) AS similarity
         FROM "ArticleChunk" ac
-        JOIN "Article" a ON a.id = ac."articleId"
-        WHERE 1 = 1
-        ${categoryFilter}
+        WHERE ac.type = 'headline'
+        ORDER BY ac.embedding <=> ${vector}::vector ASC
+        LIMIT ${limit * 3}
       )
-      SELECT *
-      FROM scored
-      WHERE rn = 1 AND similarity >= ${threshold}
-      ORDER BY similarity DESC, "createdAt" DESC
-      LIMIT ${limit}
+      SELECT
+        sc."articleId",
+        a.keyword,
+        a.headline,
+        a.categories,
+        a.sentiment,
+        a."createdAt",
+        a."updatedAt",
+        sc."chunkType",
+        sc."chunkPosition",
+        sc."chunkContent",
+        sc.similarity
+      FROM scored_chunks sc
+      JOIN "Article" a ON a.id = sc."articleId"
+      WHERE sc.similarity >= ${threshold}
+      ${categoryFilter}
+      ORDER BY sc.similarity DESC, a."createdAt" DESC
+      LIMIT ${limit * 2}
     `);
 
-    console.log(`[RAG] Semantic search returned ${rows.length} results.`);
-    return rows.map((row) => ({
+    // Verify entity/topical relevance if multi-word query
+    const tokens = tokenize(normalizedQuery);
+    const filteredRows = rows.filter((row) => {
+      const sim = Number(row.similarity);
+      // If exceptionally high vector similarity, trust the embedding
+      if (sim >= 0.78) return true;
+
+      // If query has 2+ distinct tokens, article must contain at least the core concepts in headline/keyword/chunk
+      if (tokens.length >= 2) {
+        const textToSearch = `${row.headline} ${row.keyword} ${row.chunkContent}`.toLowerCase();
+        const matchingTokens = tokens.filter((t) => textToSearch.includes(t));
+        // If query has 3+ tokens, e.g. "pm modi visit to canada", require matching at least 2 distinct key tokens
+        if (tokens.length >= 3) {
+          return matchingTokens.length >= 2;
+        }
+        return matchingTokens.length >= 1;
+      }
+      return sim >= 0.65;
+    }).slice(0, limit);
+
+    console.log(`[RAG] Semantic search returned ${filteredRows.length} relevant results (from ${rows.length} raw candidates).`);
+    return filteredRows.map((row) => ({
       articleId: row.articleId,
       headline: row.headline,
       keyword: row.keyword,
@@ -614,7 +638,8 @@ export async function keywordSearchArticles(
       return [];
     }
 
-    const whereClause: Prisma.ArticleWhereInput = {
+    // 1. Exact phrase match in keyword, headline, or categories
+    const exactWhere: Prisma.ArticleWhereInput = {
       OR: [
         { keyword: { contains: normalizedQuery, mode: 'insensitive' } },
         { headline: { contains: normalizedQuery, mode: 'insensitive' } },
@@ -623,11 +648,11 @@ export async function keywordSearchArticles(
     };
 
     if (category) {
-      whereClause.AND = [{ categories: { has: category } }];
+      exactWhere.AND = [{ categories: { has: category } }];
     }
 
-    const articles = await prisma.article.findMany({
-      where: whereClause,
+    const exactMatches = await prisma.article.findMany({
+      where: exactWhere,
       orderBy: { createdAt: 'desc' },
       take: limit,
       select: {
@@ -641,22 +666,76 @@ export async function keywordSearchArticles(
       },
     });
 
-    return articles.map((article, index) => ({
-      articleId: article.id,
-      headline: article.headline,
-      keyword: article.keyword,
-      categories: article.categories || [],
-      sentiment: article.sentiment,
-      createdAt: article.createdAt.toISOString(),
-      updatedAt: article.updatedAt.toISOString(),
-      articleUrl: articleUrl(article.categories?.[0] || 'news', article.headline),
-      chunkType: index === 0 ? 'headline' : 'summary',
-      chunkPosition: 0,
-      chunkContent: article.headline,
-      similarity: Math.max(0.45, 0.9 - index * 0.05),
-    }));
+    if (exactMatches.length > 0) {
+      return exactMatches.map((article, index) => ({
+        articleId: article.id,
+        headline: article.headline,
+        keyword: article.keyword,
+        categories: article.categories || [],
+        sentiment: article.sentiment,
+        createdAt: article.createdAt.toISOString(),
+        updatedAt: article.updatedAt.toISOString(),
+        articleUrl: articleUrl(article.categories?.[0] || 'news', article.headline),
+        chunkType: index === 0 ? 'headline' : 'summary',
+        chunkPosition: 0,
+        chunkContent: article.headline,
+        similarity: Math.max(0.7, 0.95 - index * 0.05),
+      }));
+    }
+
+    // 2. Multi-term token matching: For queries with 2 or more substantive tokens
+    const tokens = tokenize(normalizedQuery);
+    if (tokens.length >= 2) {
+      // Require ALL key tokens to be present across headline or keyword
+      const tokenConditions: Prisma.ArticleWhereInput[] = tokens.map((token) => ({
+        OR: [
+          { headline: { contains: token, mode: 'insensitive' } },
+          { keyword: { contains: token, mode: 'insensitive' } },
+        ],
+      }));
+
+      const multiTokenWhere: Prisma.ArticleWhereInput = {
+        AND: category
+          ? [...tokenConditions, { categories: { has: category } }]
+          : tokenConditions,
+      };
+
+      const tokenMatches = await prisma.article.findMany({
+        where: multiTokenWhere,
+        orderBy: { createdAt: 'desc' },
+        take: limit,
+        select: {
+          id: true,
+          keyword: true,
+          headline: true,
+          categories: true,
+          sentiment: true,
+          createdAt: true,
+          updatedAt: true,
+        },
+      });
+
+      if (tokenMatches.length > 0) {
+        return tokenMatches.map((article, index) => ({
+          articleId: article.id,
+          headline: article.headline,
+          keyword: article.keyword,
+          categories: article.categories || [],
+          sentiment: article.sentiment,
+          createdAt: article.createdAt.toISOString(),
+          updatedAt: article.updatedAt.toISOString(),
+          articleUrl: articleUrl(article.categories?.[0] || 'news', article.headline),
+          chunkType: 'headline',
+          chunkPosition: 0,
+          chunkContent: article.headline,
+          similarity: Math.max(0.65, 0.9 - index * 0.05),
+        }));
+      }
+    }
+
+    return [];
   } catch (error) {
-    console.error('[RAG] Keyword fallback search failed:', error);
+    console.error('[RAG] Keyword search failed:', error);
     return [];
   }
 }
@@ -668,12 +747,14 @@ export async function retrieveArticlesForQuery(
     category?: string;
   }
 ): Promise<RagSearchResult[]> {
-  const semanticResults = await searchSemanticArticles(query, options);
-  if (semanticResults.length > 0) {
-    return semanticResults;
+  // 1. Fast SQL Keyword match first (< 50ms)
+  const keywordResults = await keywordSearchArticles(query, options);
+  if (keywordResults.length > 0) {
+    return keywordResults;
   }
 
-  return keywordSearchArticles(query, options);
+  // 2. Semantic vector search as fallback for conceptual/indirect queries (~1-2s)
+  return searchSemanticArticles(query, options);
 }
 
 export async function buildRagAnswer(
