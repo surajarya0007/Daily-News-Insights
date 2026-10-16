@@ -13,8 +13,10 @@ export const GEMINI_INPUT_MAX_CHARS = 2_500;
 /** Use Google Search in Gemini only when scraped text is shorter than this */
 export const GEMINI_SEARCH_MIN_CHARS = 500;
 
-/** Gemini models tried in order; falls back to the next on 429 / quota errors */
+/** Gemini models tried in order; falls back to the next on 429 / quota / 503 errors */
 export const GEMINI_MODEL_CHAIN = [
+  'gemini-2.5-flash',
+  'gemini-2.5-flash-lite',
   'gemini-3.1-flash-lite',
 ] as const;
 
@@ -23,6 +25,8 @@ export const GEMINI_RPM_DELAY_MS = 6_000;
 
 /** Per-model RPM pacing delay after a successful synthesis */
 export const GEMINI_RPM_DELAY_BY_MODEL: Record<string, number> = {
+  'gemini-2.5-flash': 4_000,
+  'gemini-2.5-flash-lite': 3_000,
   'gemini-3.1-flash-lite': 6_000,
 };
 

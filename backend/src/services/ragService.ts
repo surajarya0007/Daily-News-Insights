@@ -76,14 +76,50 @@ function hasGeminiApiKey(): boolean {
   return getApiKeys().length > 0;
 }
 
-function getChatModel(apiKey?: string) {
+function getChatModel(apiKey?: string, modelName: string = GEMINI_MODEL_CHAIN[0]) {
   const key = apiKey || getApiKeys()[0];
   if (!key) {
     throw new Error('Gemini API key is not configured.');
   }
 
   const genAI = new GoogleGenerativeAI(key);
-  return genAI.getGenerativeModel({ model: CHAT_MODEL });
+  return genAI.getGenerativeModel({ model: modelName });
+}
+
+async function generateChatContentWithFallback(prompt: string): Promise<any> {
+  const apiKeys = getApiKeys();
+  let lastError: any = null;
+
+  for (let k = 0; k < apiKeys.length; k++) {
+    const key = apiKeys[k];
+    const genAI = new GoogleGenerativeAI(key);
+
+    for (const modelName of GEMINI_MODEL_CHAIN) {
+      try {
+        const model = genAI.getGenerativeModel({ model: modelName });
+        const result = await model.generateContent({
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          generationConfig: {
+            responseMimeType: 'application/json',
+          },
+        });
+        const text = result.response.text().trim();
+        return JSON.parse(text);
+      } catch (error: any) {
+        lastError = error;
+        console.warn(`[RAG] Chat synthesis failed with model ${modelName} (key index ${k}):`, error.message || error);
+        const errMsg = (error.message || '').toLowerCase();
+        const errStatus = error.status;
+        const isQuotaOrDemand = errStatus === 429 || errStatus === 503 || errMsg.includes('quota') || errMsg.includes('demand') || errMsg.includes('unavailable');
+        if (!isQuotaOrDemand) {
+          // If it is another error, try next model first
+          continue;
+        }
+      }
+    }
+  }
+
+  throw lastError || new Error('All models and API keys in fallback chain failed for chat synthesis.');
 }
 
 function getEmbeddingModel(apiKey?: string) {
@@ -698,21 +734,7 @@ Return ONLY valid JSON with:
   }
 
   try {
-    const model = getChatModel();
-    const result = await model.generateContent({
-      contents: [
-        {
-          role: 'user',
-          parts: [{ text: prompt }],
-        },
-      ],
-      generationConfig: {
-        responseMimeType: 'application/json',
-      },
-    });
-
-    const text = result.response.text().trim();
-    const parsed = JSON.parse(text);
+    const parsed = await generateChatContentWithFallback(prompt);
     console.log(`[RAG] Successfully generated answer via Gemini: "${(parsed.answer || '').slice(0, 80)}..."`);
     return {
       answer: typeof parsed.answer === 'string' ? parsed.answer : '',
@@ -790,15 +812,7 @@ Return ONLY valid JSON matching this format:
   }
 
   try {
-    const model = getChatModel();
-    const result = await model.generateContent({
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      generationConfig: {
-        responseMimeType: 'application/json',
-      },
-    });
-
-    const parsed = JSON.parse(result.response.text().trim());
+    const parsed = await generateChatContentWithFallback(prompt);
     return {
       answer: typeof parsed.answer === 'string' ? parsed.answer : '',
       suggestions: Array.isArray(parsed.suggestions)
